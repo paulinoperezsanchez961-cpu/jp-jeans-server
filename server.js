@@ -36,7 +36,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB máximo
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB máximo
   fileFilter: (_, file, cb) => {
     const tipos = /jpeg|jpg|png|webp/;
     cb(null, tipos.test(file.mimetype));
@@ -887,6 +887,41 @@ async function _registrarMovimiento({ tipo, id_pedido, id_producto, descripcion,
   }
 }
 
+
+
+// PUT /api/productos/:id/foto — actualizar foto de un producto existente
+app.put('/api/productos/:id/foto', upload.single('foto'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ exito: false, mensaje: 'No se recibió ninguna foto' });
+    }
+
+    const urlFoto = `${process.env.BASE_URL || 'https://jpintermoda.site'}/uploads/${req.file.filename}`;
+
+    // Actualizar todos los campos junto con la nueva foto
+    const {
+      nombre, precio_venta, num_paquetes,
+      piezas_por_paquete, tallas, sobrantes, stock_total, estado_produccion,
+    } = req.body;
+
+    await pool.query(
+      `UPDATE productos SET
+         nombre = ?, precio_venta = ?, num_paquetes = ?,
+         piezas_por_paquete = ?, tallas = ?, sobrantes = ?,
+         stock_total = ?, estado_produccion = ?, url_foto = ?
+       WHERE id = ?`,
+      [
+        nombre, parseFloat(precio_venta), parseInt(num_paquetes),
+        parseInt(piezas_por_paquete), tallas, sobrantes,
+        parseInt(stock_total), estado_produccion, urlFoto, req.params.id,
+      ]
+    );
+
+    res.json({ exito: true, url_foto: urlFoto });
+  } catch (err) {
+    res.status(500).json({ exito: false, mensaje: err.message });
+  }
+});
 
 // PUT /api/productos/:id/eliminar — soft delete (marca como eliminado)
 app.put('/api/productos/:id/eliminar', async (req, res) => {
