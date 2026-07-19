@@ -887,6 +887,94 @@ async function _registrarMovimiento({ tipo, id_pedido, id_producto, descripcion,
   }
 }
 
+
+// PUT /api/productos/:id/eliminar — soft delete (marca como eliminado)
+app.put('/api/productos/:id/eliminar', async (req, res) => {
+  try {
+    const [resultado] = await pool.query(
+      "UPDATE productos SET estado = 'eliminado' WHERE id = ? AND estado = 'activo'",
+      [req.params.id]
+    );
+
+    if (resultado.affectedRows === 0) {
+      return res.status(404).json({
+        exito: false,
+        mensaje: 'Producto no encontrado o ya eliminado',
+      });
+    }
+
+    await _registrarMovimiento({
+      tipo:        'REGISTRO_PRODUCTO',
+      id_producto: parseInt(req.params.id),
+      descripcion: `Producto #${req.params.id} eliminado del inventario`,
+    });
+
+    res.json({ exito: true });
+  } catch (err) {
+    res.status(500).json({ exito: false, mensaje: err.message });
+  }
+});
+
+// GET /api/analitica/prototipos — orden de producción basada en apartados reales
+app.get('/api/analitica/prototipos', async (req, res) => {
+  try {
+    const [prototipos] = await pool.query(`
+      SELECT id, sku, nombre, url_foto, tallas, piezas_por_paquete
+      FROM productos
+      WHERE estado = 'activo' AND estado_produccion = 'prototipo'
+    `);
+
+    const resultado = [];
+
+    for (const proto of prototipos) {
+      const tallas = _parseJSON(proto.tallas, []);
+
+      const [pedidosItems] = await pool.query(`
+        SELECT items FROM pedidos
+        WHERE estado IN ('activo', 'liquidado', 'enviado')
+          AND JSON_SEARCH(items, 'one', ?, NULL, '$[*].sku') IS NOT NULL
+      `, [proto.sku]);
+
+      const vendidosPorTalla = {};
+      for (const pedido of pedidosItems) {
+        const items = _parseJSON(pedido.items, []);
+        for (const item of items) {
+          if (item.sku === proto.sku) {
+            vendidosPorTalla[item.talla] =
+              (vendidosPorTalla[item.talla] || 0) + (item.cantidad || 0);
+          }
+        }
+      }
+
+      const tallasVendidas = tallas.map(t => ({
+        talla:              t.talla,
+        piezas_vendidas:    vendidosPorTalla[t.talla] || 0,
+        piezas_por_paquete: t.cantidad,
+      }));
+
+      const totalVendidas = tallasVendidas.reduce(
+        (s, t) => s + t.piezas_vendidas, 0
+      );
+
+      if (totalVendidas > 0) {
+        resultado.push({
+          sku:                proto.sku,
+          nombre:             proto.nombre,
+          url_foto:           proto.url_foto,
+          piezas_por_paquete: proto.piezas_por_paquete,
+          tallas_vendidas:    tallasVendidas,
+          total_vendidas:     totalVendidas,
+        });
+      }
+    }
+
+    resultado.sort((a, b) => b.total_vendidas - a.total_vendidas);
+    res.json({ exito: true, prototipos: resultado });
+  } catch (err) {
+    res.status(500).json({ exito: false, mensaje: err.message });
+  }
+});
+
 // ── Health check ─────────────────────────────────────────────
 app.get('/api/ping', (_, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
