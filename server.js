@@ -620,6 +620,74 @@ app.get('/api/analitica/sku', async (req, res) => {
   }
 });
 
+
+// GET /api/analitica/prototipos — orden de producción basada en apartados reales
+app.get('/api/analitica/prototipos', async (req, res) => {
+  try {
+    // Obtener todos los prototipos activos
+    const [prototipos] = await pool.query(`
+      SELECT id, sku, nombre, url_foto, tallas, piezas_por_paquete
+      FROM productos
+      WHERE estado = 'activo' AND estado_produccion = 'prototipo'
+    `);
+
+    const resultado = [];
+
+    for (const proto of prototipos) {
+      const tallas = _parseJSON(proto.tallas, []);
+
+      // Buscar pedidos activos/liquidados que contengan este SKU
+      const [pedidosItems] = await pool.query(`
+        SELECT items FROM pedidos
+        WHERE estado IN ('activo', 'liquidado', 'enviado')
+          AND JSON_SEARCH(items, 'one', ?, NULL, '$[*].sku') IS NOT NULL
+      `, [proto.sku]);
+
+      // Acumular piezas vendidas por talla
+      const vendidosPorTalla = {};
+      for (const pedido of pedidosItems) {
+        const items = _parseJSON(pedido.items, []);
+        for (const item of items) {
+          if (item.sku === proto.sku) {
+            vendidosPorTalla[item.talla] =
+              (vendidosPorTalla[item.talla] || 0) + (item.cantidad || 0);
+          }
+        }
+      }
+
+      // Construir array de tallas con piezas vendidas y entallado por paquete
+      const tallasVendidas = tallas.map(t => ({
+        talla:             t.talla,
+        piezas_vendidas:   vendidosPorTalla[t.talla] || 0,
+        piezas_por_paquete: t.cantidad,
+      }));
+
+      // Solo incluir si tiene al menos un apartado
+      const totalVendidas = tallasVendidas.reduce(
+        (s, t) => s + t.piezas_vendidas, 0
+      );
+
+      if (totalVendidas > 0) {
+        resultado.push({
+          sku:               proto.sku,
+          nombre:            proto.nombre,
+          url_foto:          proto.url_foto,
+          piezas_por_paquete: proto.piezas_por_paquete,
+          tallas_vendidas:   tallasVendidas,
+          total_vendidas:    totalVendidas,
+        });
+      }
+    }
+
+    // Ordenar por más vendido
+    resultado.sort((a, b) => b.total_vendidas - a.total_vendidas);
+
+    res.json({ exito: true, prototipos: resultado });
+  } catch (err) {
+    res.status(500).json({ exito: false, mensaje: err.message });
+  }
+});
+
 // POST /api/analitica/ia — copiloto Gemini
 app.post('/api/analitica/ia', async (req, res) => {
   try {
