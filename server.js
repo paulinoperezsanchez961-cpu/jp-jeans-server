@@ -889,8 +889,8 @@ async function _registrarMovimiento({ tipo, id_pedido, id_producto, descripcion,
 
 
 
-// PUT /api/productos/:id/foto — actualizar foto de un producto existente
-app.put('/api/productos/:id/foto', upload.single('foto'), async (req, res) => {
+// POST /api/productos/:id/foto — actualizar foto de un producto existente
+app.post('/api/productos/:id/foto', upload.single('foto'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ exito: false, mensaje: 'No se recibió ninguna foto' });
