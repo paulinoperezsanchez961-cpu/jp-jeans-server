@@ -201,6 +201,44 @@ app.put('/api/productos/:id', async (req, res) => {
       stock_total, estado_produccion,
     } = req.body;
 
+    const numPaq   = parseInt(num_paquetes)   || 0;
+    const pzasPaq  = parseInt(piezas_por_paquete) || 0;
+
+    // Multiplicar las cantidades de tallas por num_paquetes
+    // El editor manda el entallado de 1 paquete (ej. talla 32: 2 pzas)
+    // El stock real es: talla 32: 2 × numPaq pzas
+    let tallasJson = tallas;
+    if (numPaq > 0 && tallasJson) {
+      try {
+        const tallasArr = typeof tallasJson === 'string'
+          ? JSON.parse(tallasJson)
+          : tallasJson;
+        const tallasMultiplicadas = tallasArr.map(t => ({
+          talla:    t.talla,
+          cantidad: (t.cantidad || 0) * numPaq,
+        }));
+        tallasJson = JSON.stringify(tallasMultiplicadas);
+      } catch (e) {
+        // Si hay error parsing mantener tallas originales
+        console.error('Error multiplicando tallas:', e.message);
+      }
+    }
+
+    // Calcular stock total real desde las tallas ya multiplicadas
+    let stockReal = parseInt(stock_total) || 0;
+    if (numPaq > 0 && pzasPaq > 0) {
+      // stock = piezas_por_paquete × num_paquetes + sobrantes
+      let totalSobrantes = 0;
+      try {
+        const sobArr = typeof sobrantes === 'string'
+          ? JSON.parse(sobrantes)
+          : (sobrantes || []);
+        totalSobrantes = sobArr.reduce((s, t) => s + (t.cantidad || 0), 0);
+      } catch (e) {}
+      stockReal = (pzasPaq * numPaq) + totalSobrantes;
+    }
+
+    // No sobreescribir la foto existente — solo actualizar datos
     await pool.query(
       `UPDATE productos SET
          nombre = ?, precio_venta = ?, num_paquetes = ?,
@@ -208,9 +246,9 @@ app.put('/api/productos/:id', async (req, res) => {
          stock_total = ?, estado_produccion = ?
        WHERE id = ?`,
       [
-        nombre, parseFloat(precio_venta), parseInt(num_paquetes),
-        parseInt(piezas_por_paquete), tallas, sobrantes,
-        parseInt(stock_total), estado_produccion, req.params.id,
+        nombre, parseFloat(precio_venta), numPaq,
+        pzasPaq, tallasJson, sobrantes,
+        stockReal, estado_produccion, req.params.id,
       ]
     );
 
