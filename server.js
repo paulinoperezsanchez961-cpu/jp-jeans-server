@@ -480,7 +480,7 @@ app.post('/api/pedidos/cancelar/:id', async (req, res) => {
     // Devolver stock (los prototipos nunca lo descontaron)
     for (const item of items) {
       const [prod] = await conn.query(
-        'SELECT tallas, stock_total, estado_produccion FROM productos WHERE id = ?', [item.id_producto]
+        'SELECT tallas, stock_total, estado_produccion FROM productos WHERE id = ? FOR UPDATE', [item.id_producto]
       );
       if (prod.length > 0) {
         if (prod[0].estado_produccion === 'prototipo') continue;
@@ -575,18 +575,19 @@ app.post('/api/pedidos/:id/enviar-correo', async (req, res) => {
 
 app.get('/api/oficina/dashboard', async (req, res) => {
   try {
+    // Un pedido 'enviado' ya fue liquidado — sigue contando como cobrado
     const [[dinero]]  = await pool.query(`
       SELECT
-        COALESCE(SUM(CASE WHEN estado = 'liquidado' THEN total ELSE 0 END), 0) AS total_cobrado,
-        COALESCE(SUM(CASE WHEN estado = 'activo'    THEN anticipo ELSE 0 END), 0) AS anticipos,
-        COALESCE(SUM(CASE WHEN estado = 'activo'    THEN saldo    ELSE 0 END), 0) AS saldo_por_cobrar
+        COALESCE(SUM(CASE WHEN estado IN ('liquidado', 'enviado') THEN total ELSE 0 END), 0) AS total_cobrado,
+        COALESCE(SUM(CASE WHEN estado = 'activo' THEN anticipo ELSE 0 END), 0) AS anticipos,
+        COALESCE(SUM(CASE WHEN estado = 'activo' THEN saldo    ELSE 0 END), 0) AS saldo_por_cobrar
       FROM pedidos
     `);
 
     const [[conteos]] = await pool.query(`
       SELECT
-        COUNT(CASE WHEN estado = 'activo'    THEN 1 END) AS pedidos_activos,
-        COUNT(CASE WHEN estado = 'liquidado' THEN 1 END) AS pedidos_liquidados,
+        COUNT(CASE WHEN estado = 'activo' THEN 1 END) AS pedidos_activos,
+        COUNT(CASE WHEN estado IN ('liquidado', 'enviado') THEN 1 END) AS pedidos_liquidados,
         COUNT(CASE WHEN estado = 'cancelado' THEN 1 END) AS pedidos_cancelados
       FROM pedidos
     `);
