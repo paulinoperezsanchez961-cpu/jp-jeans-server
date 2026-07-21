@@ -822,6 +822,18 @@ app.get('/api/analitica/prototipos', async (req, res) => {
         piezas_por_paquete: t.cantidad,
       }));
 
+      // Tallas agregadas al personalizar el pedido que la muestra no
+      // trae — también cuentan para la orden de producción
+      for (const [talla, vendidas] of Object.entries(vendidosPorTalla)) {
+        if (!tallas.some(t => t.talla === talla)) {
+          tallasVendidas.push({
+            talla,
+            piezas_vendidas:    vendidas,
+            piezas_por_paquete: 0, // no está en el entallado base
+          });
+        }
+      }
+
       // Solo incluir si tiene al menos un apartado
       const totalVendidas = tallasVendidas.reduce(
         (s, t) => s + t.piezas_vendidas, 0
