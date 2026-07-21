@@ -264,9 +264,35 @@ app.post('/api/pedidos/nuevo', async (req, res) => {
 
     const {
       nombre_cliente, email_cliente, telefono_cliente, direccion_cliente,
-      items, subtotal, descuento_porcentaje, descuento_monto,
-      total, anticipo, saldo, total_piezas,
+      items, descuento_porcentaje, anticipo,
     } = req.body;
+
+    // 0. Recalcular las cuentas desde los items — la BD, el correo y el
+    //    recibo nunca deben depender de lo que calcule el cliente
+    const redondear = n => Math.round(n * 100) / 100;
+    const itemsArr = Array.isArray(items) ? items : [];
+    if (itemsArr.length === 0) {
+      await conn.rollback();
+      return res.status(400).json({ exito: false, mensaje: 'El pedido no tiene items' });
+    }
+
+    const subtotalCalc = redondear(itemsArr.reduce(
+      (s, i) => s + (parseFloat(i.precio_unitario) || 0) * (parseInt(i.cantidad) || 0), 0));
+    const descPct     = Math.min(Math.max(parseFloat(descuento_porcentaje) || 0, 0), 100);
+    const descMonto   = redondear(subtotalCalc * (descPct / 100));
+    const totalCalc   = redondear(subtotalCalc - descMonto);
+    const anticipoNum = redondear(parseFloat(anticipo) || 0);
+    const piezasCalc  = itemsArr.reduce((s, i) => s + (parseInt(i.cantidad) || 0), 0);
+
+    if (anticipoNum <= 0) {
+      await conn.rollback();
+      return res.status(400).json({ exito: false, mensaje: 'El anticipo es requerido' });
+    }
+    if (anticipoNum > totalCalc) {
+      await conn.rollback();
+      return res.status(400).json({ exito: false, mensaje: 'El anticipo no puede ser mayor al total' });
+    }
+    const saldoCalc = redondear(totalCalc - anticipoNum);
 
     // 1. Guardar o buscar cliente
     let idCliente;
@@ -284,7 +310,7 @@ app.post('/api/pedidos/nuevo', async (req, res) => {
     }
 
     // 2. Descontar stock por talla
-    for (const item of items) {
+    for (const item of itemsArr) {
       const [producto] = await conn.query(
         'SELECT tallas, stock_total, estado_produccion FROM productos WHERE id = ? FOR UPDATE',
         [item.id_producto]
@@ -320,9 +346,9 @@ app.post('/api/pedidos/nuevo', async (req, res) => {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'activo', ?, ?)`,
       [
         idCliente, nombre_cliente, telefono_cliente, email_cliente,
-        direccion_cliente, subtotal, descuento_porcentaje || 0,
-        descuento_monto || 0, total, anticipo, saldo,
-        JSON.stringify(items), total_piezas,
+        direccion_cliente, subtotalCalc, descPct,
+        descMonto, totalCalc, anticipoNum, saldoCalc,
+        JSON.stringify(itemsArr), piezasCalc,
       ]
     );
     const pedidoId = pedido.insertId;
@@ -330,7 +356,7 @@ app.post('/api/pedidos/nuevo', async (req, res) => {
     // 4. Registrar abono inicial
     await conn.query(
       'INSERT INTO abonos (id_pedido, monto, metodo_pago) VALUES (?, ?, ?)',
-      [pedidoId, anticipo, 'Efectivo']
+      [pedidoId, anticipoNum, 'Efectivo']
     );
 
     // 5. Bitácora
@@ -340,8 +366,8 @@ app.post('/api/pedidos/nuevo', async (req, res) => {
       [
         pedidoId,
         `Nuevo pedido de ${nombre_cliente}`,
-        anticipo, total_piezas,
-        JSON.stringify(items.map(i => ({ sku: i.sku, cantidad: i.cantidad, talla: i.talla }))),
+        anticipoNum, piezasCalc,
+        JSON.stringify(itemsArr.map(i => ({ sku: i.sku, cantidad: i.cantidad, talla: i.talla }))),
       ]
     );
 
@@ -349,7 +375,8 @@ app.post('/api/pedidos/nuevo', async (req, res) => {
 
     // 6. Enviar correo de confirmación (async, no bloquea)
     _enviarCorreoPedido({ pedidoId, nombre_cliente, email_cliente,
-      items, total, anticipo, saldo, descuento_porcentaje })
+      items: itemsArr, total: totalCalc, anticipo: anticipoNum,
+      saldo: saldoCalc, descuento_porcentaje: descPct })
       .catch(e => console.error('Error correo pedido:', e));
 
     res.json({ exito: true, id: pedidoId });
