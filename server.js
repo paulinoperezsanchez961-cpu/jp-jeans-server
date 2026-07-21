@@ -165,6 +165,11 @@ app.post('/api/productos', upload.single('foto'), async (req, res) => {
       ? `${process.env.BASE_URL || 'https://jpintermoda.site'}/uploads/${req.file.filename}`
       : null;
 
+    // La app manda el entallado de 1 paquete; en BD las tallas guardan el
+    // stock total por talla (entallado × num_paquetes). Prototipos (numPaq 0)
+    // conservan el entallado tal cual.
+    const tallasJson = _multiplicarTallas(tallas, parseInt(num_paquetes) || 0);
+
     const [result] = await pool.query(
       `INSERT INTO productos
          (sku, nombre, precio_venta, piezas_por_paquete, num_paquetes,
@@ -173,7 +178,7 @@ app.post('/api/productos', upload.single('foto'), async (req, res) => {
       [
         sku.toUpperCase(), nombre,
         parseFloat(precio_venta), parseInt(piezas_por_paquete),
-        parseInt(num_paquetes), tallas, sobrantes,
+        parseInt(num_paquetes), tallasJson, sobrantes,
         parseInt(stock_total), urlFoto, estado_produccion || 'produccion',
       ]
     );
@@ -207,22 +212,7 @@ app.put('/api/productos/:id', async (req, res) => {
     // Multiplicar las cantidades de tallas por num_paquetes
     // El editor manda el entallado de 1 paquete (ej. talla 32: 2 pzas)
     // El stock real es: talla 32: 2 × numPaq pzas
-    let tallasJson = tallas;
-    if (numPaq > 0 && tallasJson) {
-      try {
-        const tallasArr = typeof tallasJson === 'string'
-          ? JSON.parse(tallasJson)
-          : tallasJson;
-        const tallasMultiplicadas = tallasArr.map(t => ({
-          talla:    t.talla,
-          cantidad: (t.cantidad || 0) * numPaq,
-        }));
-        tallasJson = JSON.stringify(tallasMultiplicadas);
-      } catch (e) {
-        // Si hay error parsing mantener tallas originales
-        console.error('Error multiplicando tallas:', e.message);
-      }
-    }
+    const tallasJson = _multiplicarTallas(tallas, numPaq);
 
     // Calcular stock total real desde las tallas ya multiplicadas
     let stockReal = parseInt(stock_total) || 0;
@@ -292,10 +282,14 @@ app.post('/api/pedidos/nuevo', async (req, res) => {
     // 2. Descontar stock por talla
     for (const item of items) {
       const [producto] = await conn.query(
-        'SELECT tallas, stock_total FROM productos WHERE id = ? FOR UPDATE',
+        'SELECT tallas, stock_total, estado_produccion FROM productos WHERE id = ? FOR UPDATE',
         [item.id_producto]
       );
       if (producto.length === 0) throw new Error(`Producto ${item.sku} no encontrado`);
+
+      // Los prototipos no tienen stock: se apartan sobre pedido y sus
+      // tallas guardan el entallado, no existencias. No descontar nada.
+      if (producto[0].estado_produccion === 'prototipo') continue;
 
       const tallas = _parseJSON(producto[0].tallas, []);
       const tallaIdx = tallas.findIndex(t => t.talla === item.talla);
@@ -419,6 +413,7 @@ app.post('/api/pedidos/liquidar/:id', async (req, res) => {
       'SELECT * FROM pedidos WHERE id = ? AND estado = "activo"', [id]
     );
     if (pedidoRows.length === 0) {
+      await conn.rollback();
       return res.status(404).json({ exito: false, mensaje: 'Pedido no encontrado o ya liquidado' });
     }
     const pedido = pedidoRows[0];
@@ -475,18 +470,20 @@ app.post('/api/pedidos/cancelar/:id', async (req, res) => {
       'SELECT * FROM pedidos WHERE id = ? AND estado = "activo"', [id]
     );
     if (pedidoRows.length === 0) {
+      await conn.rollback();
       return res.status(404).json({ exito: false, mensaje: 'Pedido no encontrado' });
     }
 
     const pedido = pedidoRows[0];
     const items  = _parseJSON(pedido.items, []);
 
-    // Devolver stock
+    // Devolver stock (los prototipos nunca lo descontaron)
     for (const item of items) {
       const [prod] = await conn.query(
-        'SELECT tallas, stock_total FROM productos WHERE id = ?', [item.id_producto]
+        'SELECT tallas, stock_total, estado_produccion FROM productos WHERE id = ?', [item.id_producto]
       );
       if (prod.length > 0) {
+        if (prod[0].estado_produccion === 'prototipo') continue;
         const tallas  = _parseJSON(prod[0].tallas, []);
         const tallaIdx = tallas.findIndex(t => t.talla === item.talla);
         if (tallaIdx >= 0) tallas[tallaIdx].cantidad += item.cantidad;
@@ -609,6 +606,27 @@ app.get('/api/oficina/dashboard', async (req, res) => {
       'SELECT COUNT(*) AS total FROM productos WHERE estado = "activo"'
     );
 
+    // Paquetes: recorrer productos y calcular disponibles/vendidos
+    const [prods] = await pool.query(`
+      SELECT piezas_por_paquete, num_paquetes, stock_total
+      FROM productos WHERE estado = 'activo'
+    `);
+
+    let paquetesRegistrados = 0;
+    let paquetesDisponibles = 0;
+    for (const p of prods) {
+      const pzasPaq = parseInt(p.piezas_por_paquete) || 0;
+      const numPaq  = parseInt(p.num_paquetes)       || 0;
+      const stock   = parseInt(p.stock_total)        || 0;
+      paquetesRegistrados += numPaq;
+      if (pzasPaq > 0) {
+        paquetesDisponibles += Math.floor(stock / pzasPaq);
+      }
+    }
+    const paquetesVendidos = Math.max(
+      paquetesRegistrados - paquetesDisponibles, 0
+    );
+
     const piezasRegistradas = piezas.piezas_registradas + vendidas.piezas_vendidas;
     const piezasDisponibles = piezas.piezas_registradas;
     const piezasVendidas    = vendidas.piezas_vendidas;
@@ -618,10 +636,13 @@ app.get('/api/oficina/dashboard', async (req, res) => {
       datos: {
         ...dinero,
         ...conteos,
-        piezas_registradas: piezasRegistradas,
-        piezas_vendidas:    piezasVendidas,
-        piezas_disponibles: piezasDisponibles,
-        skus_registrados:   skus.total,
+        piezas_registradas:   piezasRegistradas,
+        piezas_vendidas:      piezasVendidas,
+        piezas_disponibles:   piezasDisponibles,
+        paquetes_registrados: paquetesRegistrados,
+        paquetes_vendidos:    paquetesVendidos,
+        paquetes_disponibles: paquetesDisponibles,
+        skus_registrados:     skus.total,
         ultima_actualizacion: new Date().toISOString(),
       },
     });
@@ -636,23 +657,92 @@ app.get('/api/oficina/dashboard', async (req, res) => {
 
 app.get('/api/analitica/sku', async (req, res) => {
   try {
-    // Agrupar piezas vendidas por SKU desde los movimientos
-    const [rows] = await pool.query(`
-      SELECT
-        p.sku,
-        p.nombre,
-        p.stock_total AS piezas_disponibles,
-        COALESCE(SUM(pe.total_piezas), 0) AS piezas_vendidas,
-        (p.stock_total + COALESCE(SUM(pe.total_piezas), 0)) AS piezas_total
-      FROM productos p
-      LEFT JOIN pedidos pe ON JSON_CONTAINS(pe.items, JSON_OBJECT('sku', p.sku))
-        AND pe.estado IN ('activo', 'liquidado', 'enviado')
-      WHERE p.estado = 'activo'
-      GROUP BY p.id, p.sku, p.nombre, p.stock_total
-      ORDER BY piezas_vendidas DESC
+    // 1. Traer todos los productos activos
+    const [productos] = await pool.query(`
+      SELECT id, sku, nombre, url_foto, tallas, sobrantes,
+             piezas_por_paquete, num_paquetes, stock_total, estado_produccion
+      FROM productos
+      WHERE estado = 'activo'
     `);
 
-    res.json({ exito: true, skus: rows });
+    // 2. Traer todos los pedidos vigentes UNA sola vez
+    const [pedidos] = await pool.query(`
+      SELECT items FROM pedidos
+      WHERE estado IN ('activo', 'liquidado', 'enviado')
+    `);
+
+    // 3. Acumular piezas vendidas por SKU y por talla
+    const ventasPorSku = {};   // { sku: { total: n, tallas: { '32': n } } }
+    for (const pedido of pedidos) {
+      const items = _parseJSON(pedido.items, []);
+      for (const item of items) {
+        const sku = item.sku;
+        if (!sku) continue;
+        if (!ventasPorSku[sku]) ventasPorSku[sku] = { total: 0, tallas: {} };
+        const cant = parseInt(item.cantidad) || 0;
+        ventasPorSku[sku].total += cant;
+        ventasPorSku[sku].tallas[item.talla] =
+          (ventasPorSku[sku].tallas[item.talla] || 0) + cant;
+      }
+    }
+
+    // 4. Construir respuesta con paquetes y piezas
+    const skus = productos.map(p => {
+      const venta      = ventasPorSku[p.sku] || { total: 0, tallas: {} };
+      const pzasPaq    = parseInt(p.piezas_por_paquete) || 0;
+      const numPaq     = parseInt(p.num_paquetes) || 0;
+
+      const piezasVendidas = venta.total;
+      const piezasTotal    = pzasPaq * numPaq;
+      const piezasDisp     = Math.max(piezasTotal - piezasVendidas, 0);
+
+      // Paquetes vendidos y disponibles
+      const paquetesVendidos    = pzasPaq > 0
+        ? Math.floor(piezasVendidas / pzasPaq) : 0;
+      const paquetesDisponibles = pzasPaq > 0
+        ? Math.floor(piezasDisp / pzasPaq) : 0;
+
+      // Talla más vendida y con más sobrante
+      const tallasVendidas = venta.tallas;
+      let tallaMas = '—', maxV = -1;
+      for (const [t, c] of Object.entries(tallasVendidas)) {
+        if (c > maxV) { maxV = c; tallaMas = t; }
+      }
+
+      // Talla con más piezas sin vender.
+      // En producción las tallas de BD ya vienen decrementadas por las
+      // ventas, así que t.cantidad ES el sobrante (no restar de nuevo).
+      // En prototipos no hay stock: gana la talla menos apartada.
+      const tallasProducto = _parseJSON(p.tallas, []);
+      let tallaMenos = '—', maxSobra = -Infinity;
+      for (const t of tallasProducto) {
+        const sobra = p.estado_produccion === 'prototipo'
+          ? -(tallasVendidas[t.talla] || 0)
+          : (t.cantidad || 0);
+        if (sobra > maxSobra) { maxSobra = sobra; tallaMenos = t.talla; }
+      }
+
+      return {
+        sku:                  p.sku,
+        nombre:               p.nombre,
+        url_foto:             p.url_foto,
+        estado_produccion:    p.estado_produccion,
+        piezas_por_paquete:   pzasPaq,
+        piezas_vendidas:      piezasVendidas,
+        piezas_disponibles:   piezasDisp,
+        piezas_total:         piezasTotal,
+        paquetes_vendidos:    paquetesVendidos,
+        paquetes_disponibles: paquetesDisponibles,
+        paquetes_total:       numPaq,
+        talla_mas:            tallaMas,
+        talla_menos:          tallaMenos,
+      };
+    });
+
+    // Ordenar por más vendido
+    skus.sort((a, b) => b.piezas_vendidas - a.piezas_vendidas);
+
+    res.json({ exito: true, skus });
   } catch (err) {
     res.status(500).json({ exito: false, mensaje: err.message });
   }
@@ -706,13 +796,26 @@ app.get('/api/analitica/prototipos', async (req, res) => {
       );
 
       if (totalVendidas > 0) {
+        // Paquetes a fabricar = el máximo necesario para cubrir todas las tallas
+        let paquetesAFabricar = 0;
+        for (const t of tallasVendidas) {
+          if (t.piezas_por_paquete > 0) {
+            const paq = Math.ceil(t.piezas_vendidas / t.piezas_por_paquete);
+            if (paq > paquetesAFabricar) paquetesAFabricar = paq;
+          }
+        }
+
+        const pzasPaq = parseInt(proto.piezas_por_paquete) || 0;
+
         resultado.push({
-          sku:               proto.sku,
-          nombre:            proto.nombre,
-          url_foto:          proto.url_foto,
-          piezas_por_paquete: proto.piezas_por_paquete,
-          tallas_vendidas:   tallasVendidas,
-          total_vendidas:    totalVendidas,
+          sku:                 proto.sku,
+          nombre:              proto.nombre,
+          url_foto:            proto.url_foto,
+          piezas_por_paquete:  pzasPaq,
+          tallas_vendidas:     tallasVendidas,
+          total_vendidas:      totalVendidas,
+          paquetes_a_fabricar: paquetesAFabricar,
+          piezas_a_fabricar:   paquetesAFabricar * pzasPaq,
         });
       }
     }
@@ -912,6 +1015,23 @@ function _parseJSON(valor, fallback) {
   catch { return fallback; }
 }
 
+// La app siempre manda el entallado de 1 paquete; en BD las tallas guardan
+// el stock total por talla (entallado × num_paquetes). Con numPaq 0
+// (prototipos) se conserva el entallado tal cual.
+function _multiplicarTallas(tallas, numPaq) {
+  if (!tallas || numPaq <= 0) return tallas;
+  try {
+    const arr = typeof tallas === 'string' ? JSON.parse(tallas) : tallas;
+    return JSON.stringify(arr.map(t => ({
+      talla:    t.talla,
+      cantidad: (t.cantidad || 0) * numPaq,
+    })));
+  } catch (e) {
+    console.error('Error multiplicando tallas:', e.message);
+    return tallas;
+  }
+}
+
 async function _registrarMovimiento({ tipo, id_pedido, id_producto, descripcion, monto, piezas, sku_detalle }) {
   try {
     await pool.query(
@@ -942,6 +1062,10 @@ app.post('/api/productos/:id/foto', upload.single('foto'), async (req, res) => {
       piezas_por_paquete, tallas, sobrantes, stock_total, estado_produccion,
     } = req.body;
 
+    // Igual que en el PUT: la app manda el entallado de 1 paquete
+    const numPaq     = parseInt(num_paquetes) || 0;
+    const tallasJson = _multiplicarTallas(tallas, numPaq);
+
     await pool.query(
       `UPDATE productos SET
          nombre = ?, precio_venta = ?, num_paquetes = ?,
@@ -949,8 +1073,8 @@ app.post('/api/productos/:id/foto', upload.single('foto'), async (req, res) => {
          stock_total = ?, estado_produccion = ?, url_foto = ?
        WHERE id = ?`,
       [
-        nombre, parseFloat(precio_venta), parseInt(num_paquetes),
-        parseInt(piezas_por_paquete), tallas, sobrantes,
+        nombre, parseFloat(precio_venta), numPaq,
+        parseInt(piezas_por_paquete), tallasJson, sobrantes,
         parseInt(stock_total), estado_produccion, urlFoto, req.params.id,
       ]
     );
@@ -983,66 +1107,6 @@ app.put('/api/productos/:id/eliminar', async (req, res) => {
     });
 
     res.json({ exito: true });
-  } catch (err) {
-    res.status(500).json({ exito: false, mensaje: err.message });
-  }
-});
-
-// GET /api/analitica/prototipos — orden de producción basada en apartados reales
-app.get('/api/analitica/prototipos', async (req, res) => {
-  try {
-    const [prototipos] = await pool.query(`
-      SELECT id, sku, nombre, url_foto, tallas, piezas_por_paquete
-      FROM productos
-      WHERE estado = 'activo' AND estado_produccion = 'prototipo'
-    `);
-
-    const resultado = [];
-
-    for (const proto of prototipos) {
-      const tallas = _parseJSON(proto.tallas, []);
-
-      const [pedidosItems] = await pool.query(`
-        SELECT items FROM pedidos
-        WHERE estado IN ('activo', 'liquidado', 'enviado')
-          AND JSON_SEARCH(items, 'one', ?, NULL, '$[*].sku') IS NOT NULL
-      `, [proto.sku]);
-
-      const vendidosPorTalla = {};
-      for (const pedido of pedidosItems) {
-        const items = _parseJSON(pedido.items, []);
-        for (const item of items) {
-          if (item.sku === proto.sku) {
-            vendidosPorTalla[item.talla] =
-              (vendidosPorTalla[item.talla] || 0) + (item.cantidad || 0);
-          }
-        }
-      }
-
-      const tallasVendidas = tallas.map(t => ({
-        talla:              t.talla,
-        piezas_vendidas:    vendidosPorTalla[t.talla] || 0,
-        piezas_por_paquete: t.cantidad,
-      }));
-
-      const totalVendidas = tallasVendidas.reduce(
-        (s, t) => s + t.piezas_vendidas, 0
-      );
-
-      if (totalVendidas > 0) {
-        resultado.push({
-          sku:                proto.sku,
-          nombre:             proto.nombre,
-          url_foto:           proto.url_foto,
-          piezas_por_paquete: proto.piezas_por_paquete,
-          tallas_vendidas:    tallasVendidas,
-          total_vendidas:     totalVendidas,
-        });
-      }
-    }
-
-    resultado.sort((a, b) => b.total_vendidas - a.total_vendidas);
-    res.json({ exito: true, prototipos: resultado });
   } catch (err) {
     res.status(500).json({ exito: false, mensaje: err.message });
   }
