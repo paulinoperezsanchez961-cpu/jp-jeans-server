@@ -17,14 +17,18 @@ const app    = express();
 const resend = new Resend(process.env.RESEND_API_KEY);
 const PORT   = process.env.PORT || 3000;
 
+// ── Carpeta de uploads ───────────────────────────────────────
+// UPLOADS_DIR (en .env): ruta FUERA del proyecto para que el deploy
+// automático de GitHub no borre las fotos en cada push.
+// Ej: UPLOADS_DIR=/home/usuario/jp_uploads
+// Sin la variable usa ./uploads (se pierde en cada deploy).
+const uploadsDir = process.env.UPLOADS_DIR || path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+
 // ── Middleware ───────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
-// ── Carpeta de uploads ───────────────────────────────────────
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+app.use('/uploads', express.static(uploadsDir));
 
 // ── Multer para fotos de productos ──────────────────────────
 const storage = multer.diskStorage({
